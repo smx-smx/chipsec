@@ -57,6 +57,7 @@ class SMBus(hal_base.HALBase):
         self.smb_reg_control = 'SMBUS_HST_CNT'
         self.smb_reg_data0 = 'SMBUS_HST_D0'
         self.smb_reg_data1 = 'SMBUS_HST_D1'
+        self.smb_reg_block_data = 'SMBUS_HST_BD'
 
     def get_SMBus_Base_Address(self) -> int:
         if self.iobar.is_IO_BAR_defined('SMBUS_BASE'):
@@ -161,6 +162,93 @@ class SMBus(hal_base.HALBase):
                             self.logger.log_error("SMBus bus error")
                         return False
         return 0 == busy
+
+    def read_block(self, target_address, offset, block_size):
+         # clear status bits
+        self.cs.write_register(self.smb_reg_status, 0xFF)
+
+        # SMBus txn RW direction = Read, SMBus slave address = target_address
+        hst_sa = 0x0
+        hst_sa = self.cs.set_register_field(self.smb_reg_address, hst_sa, 'RW', SMBUS_COMMAND_READ)
+        hst_sa = self.cs.set_register_field(self.smb_reg_address, hst_sa, 'Address', target_address, True)
+        self.cs.write_register(self.smb_reg_address, hst_sa)
+        # command data = byte offset (bus txn address)
+        self.cs.write_register_field(self.smb_reg_command, 'DataOffset', offset)
+        # command = Byte Data
+        # if self.cs.register_has_field( self.smb_reg_control, 'SMB_CMD' ):
+        self.cs.write_register_field(self.smb_reg_control, 'SMB_CMD', SMBUS_COMMAND_BLOCK)
+        # send SMBus txn
+        self.cs.write_register_field(self.smb_reg_control, 'START', 1)
+
+        # wait for cycle to complete
+        if not self._wait_for_cycle():
+            return []
+
+        # read the data
+        size = self.cs.read_register_field(self.smb_reg_data0, 'Data')
+        self.logger.log("[smbus] block size: {:X}".format(size))
+
+        num_to_read = block_size if block_size is not None else size
+
+        buffer = [chr(0xFF)] * size
+        for i in range(num_to_read - 1):
+            buffer[i] = chr(self.cs.read_register_field(self.smb_reg_block_data, 'BlockData'))
+        
+        self.cs.write_register_field(self.smb_reg_control, 'LAST_BYTE', 1)        
+        buffer[num_to_read-1] = chr(self.cs.read_register_field(self.smb_reg_block_data, 'BlockData'))
+
+        # clear status bits
+        self.cs.write_register(self.smb_reg_status, 0xFF)
+        # clear address/offset registers
+        #chipsec.chipset.write_register( self.cs, self.smb_reg_address, 0x0 )
+        #chipsec.chipset.write_register( self.cs, self.smb_reg_command, 0x0 )
+        
+        #if self.logger.HAL:
+        #    self.logger.log("[smbus] read device {:X} off {:X} = {:X}".format(target_address, offset, value))
+        return buffer
+
+    def write_block(self, target_address, offset, buf):
+        # clear status bits
+        self.cs.write_register(self.smb_reg_status, 0xFF)
+
+        # SMBus txn RW direction = Write, SMBus slave address = target_address
+        hst_sa = 0x0
+        hst_sa = self.cs.set_register_field(self.smb_reg_address, hst_sa, 'RW', SMBUS_COMMAND_WRITE)
+        hst_sa = self.cs.set_register_field(self.smb_reg_address, hst_sa, 'Address', target_address, True)
+        self.cs.write_register(self.smb_reg_address, hst_sa)
+        # command data = byte offset (bus txn address)
+        self.cs.write_register_field(self.smb_reg_command, 'DataOffset', offset)
+
+        # command = Byte Data
+        # if self.cs.register_has_field( self.smb_reg_control, 'SMB_CMD' ):
+        self.cs.write_register_field(self.smb_reg_control, 'SMB_CMD', SMBUS_COMMAND_BLOCK)
+
+        # write the data length
+        amount = len(buf)
+        self.cs.write_register_field(self.smb_reg_data0, 'Data', amount)
+        
+        for x in buf:
+            # write byte
+            self.cs.write_register_field(self.smb_reg_block_data, 'BlockData', x)
+            # clear done flag to signal advance the SRAM pointer
+            self.cs.write_register_field(self.smb_reg_status, 'DS', 0)
+            if not self._wait_for_cycle():
+                return 0xFF
+
+        # send SMBus txn
+        self.cs.write_register_field(self.smb_reg_control, 'START', 1)
+           
+        # wait for cycle to complete
+        if not self._wait_for_cycle():
+            return False
+        # clear status bits
+        self.cs.write_register(self.smb_reg_status, 0xFF)
+        # clear address/offset registers
+        #chipsec.chipset.write_register( self.cs, self.smb_reg_address, 0x0 )
+        #chipsec.chipset.write_register( self.cs, self.smb_reg_command, 0x0 )
+        if self.logger.HAL:
+            self.logger.log("[smbus] write to device {:X} off {:X} = {}".format(target_address, offset, ''.join('{:02x}'.format(x) for x in buf)))
+        return True
 
     def read_byte(self, target_address: int, offset: int) -> int:
         # clear status bits

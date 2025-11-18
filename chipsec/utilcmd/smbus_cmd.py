@@ -74,11 +74,11 @@ class SMBusCommand(BaseCommand):
         if self.size is not None:
             buf = self._smbus.read_block(self.dev_addr, self.start_off, self.size)
             self.logger.log("[CHIPSEC] SMBus block read: device 0x{:X} offset 0x{:X} size 0x{:X}".format(self.dev_addr, self.start_off, self.size))
-            print_buffer(buf)
+            print_buffer_bytes(buf)
         else:
             buf = self._smbus.read_block(self.dev_addr, self.start_off, None)
             self.logger.log("[CHIPSEC] SMBus block read: device 0x{:X} offset 0x{:X} size 0x{:X}".format(self.dev_addr, self.start_off, len(buf)))
-            print_buffer(buf)
+            print_buffer_bytes(buf)
 
     
     def smbus_block_write(self):

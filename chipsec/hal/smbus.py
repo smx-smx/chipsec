@@ -45,6 +45,8 @@ SMBUS_POLL_COUNT = 1000
 SMBUS_COMMAND_WRITE = 0
 SMBUS_COMMAND_READ = 1
 
+SMBUS_BLOCK_DONE_STATUS = 0x80
+
 
 class SMBus(hal_base.HALBase):
 
@@ -129,6 +131,15 @@ class SMBus(hal_base.HALBase):
                 return True
         return 0 == busy
 
+    def _wait_for_byte_done(self) -> bool:
+        for i in range(SMBUS_POLL_COUNT):
+            sts = self.cs.register.read(self.smb_reg_status)
+            ds = self.cs.register.get_field(self.smb_reg_status, sts, 'DS')
+            if 0 == ds:
+                continue
+            return True
+        return False
+
     # waits for SMBus transaction to complete
     def _wait_for_cycle(self) -> bool:
         busy = None
@@ -138,6 +149,7 @@ class SMBus(hal_base.HALBase):
             busy = self.cs.register.get_field(self.smb_reg_status, sts, 'BUSY')
             intr = self.cs.register.get_field(self.smb_reg_status, sts, 'INTR')
             failed = self.cs.register.get_field(self.smb_reg_status, sts, 'FAILED')
+            ds = self.cs.register.get_field(self.smb_reg_status, sts, 'DS')
             if 0 == busy and 1 == intr:
                 # if self.logger.HAL:
                 #    intr = chipsec.chipset.get_register_field( self.cs, self.smb_reg_status, sts, 'INTR' )
@@ -164,7 +176,7 @@ class SMBus(hal_base.HALBase):
         return 0 == busy
 
     def read_block(self, target_address, offset, block_size):
-         # clear status bits
+        # clear status bits
         self.cs.register.write(self.smb_reg_status, 0xFF)
 
         # SMBus txn RW direction = Read, SMBus slave address = target_address
@@ -174,40 +186,46 @@ class SMBus(hal_base.HALBase):
         self.cs.register.write(self.smb_reg_address, hst_sa)
         # command data = byte offset (bus txn address)
         self.cs.register.write_field(self.smb_reg_command, 'DataOffset', offset)
-        # command = Byte Data
-        # if self.cs.register_has_field( self.smb_reg_control, 'SMB_CMD' ):
+        # command = Block Data
+        # if self.cs.register.has_field( self.smb_reg_control, 'SMB_CMD' ):
         self.cs.register.write_field(self.smb_reg_control, 'SMB_CMD', SMBUS_COMMAND_BLOCK)
         # send SMBus txn
         self.cs.register.write_field(self.smb_reg_control, 'START', 1)
 
         # wait for cycle to complete
         if not self._wait_for_cycle():
+            self.cs.register.write(self.smb_reg_status, 0xFF)
+            self.logger.log_error("SMBus transaction failed (START)")
             return []
 
-        # read the data
+        # read the actual block size
         size = self.cs.register.read_field(self.smb_reg_data0, 'Data')
         self.logger.log("[smbus] block size: {:X}".format(size))
 
-        num_to_read = block_size if block_size is not None else size
+        if size < 1:
+            self.cs.register.write(self.smb_reg_status, 0xFF)
+            return []
 
-        buffer = [chr(0xFF)] * size
-        for i in range(num_to_read - 1):
-            buffer[i] = chr(self.cs.register.read_field(self.smb_reg_block_data, 'BlockData'))
-        
-        self.cs.register.write_field(self.smb_reg_control, 'LAST_BYTE', 1)        
-        buffer[num_to_read-1] = chr(self.cs.register.read_field(self.smb_reg_block_data, 'BlockData'))
+        buffer = bytearray([0xff * size])
+        for i in range(size):
+            if not self._wait_for_byte_done():
+                self.cs.register.write(self.smb_reg_status, 0xFF)
+                self.logger.log_error(f"SMBus transaction failed (reading byte {i})")
+                return []
+            buffer[i] = self.cs.register.read_field(self.smb_reg_block_data, 'BlockData')
+            if i == (size - 1):
+                self.cs.register.write_field(self.smb_reg_control, 'LAST_BYTE', 1)
+            self.cs.register.write(self.smb_reg_status, SMBUS_BLOCK_DONE_STATUS)
 
         # clear status bits
         self.cs.register.write(self.smb_reg_status, 0xFF)
-        # clear address/offset registers
-        #chipsec.chipset.write_register( self.cs, self.smb_reg_address, 0x0 )
-        #chipsec.chipset.write_register( self.cs, self.smb_reg_command, 0x0 )
-        
-        #if self.logger.HAL:
-        #    self.logger.log("[smbus] read device {:X} off {:X} = {:X}".format(target_address, offset, value))
         return buffer
 
     def write_block(self, target_address, offset, buf):
+        amount = len(buf)
+        if amount < 1:
+            return False
+
         # clear status bits
         self.cs.register.write(self.smb_reg_status, 0xFF)
 
@@ -223,29 +241,35 @@ class SMBus(hal_base.HALBase):
         # if self.cs.register_has_field( self.smb_reg_control, 'SMB_CMD' ):
         self.cs.register.write_field(self.smb_reg_control, 'SMB_CMD', SMBUS_COMMAND_BLOCK)
 
-        # write the data length
-        amount = len(buf)
+        # write the data length and first byte
         self.cs.register.write_field(self.smb_reg_data0, 'Data', amount)
-        
-        for x in buf:
-            # write byte
-            self.cs.register.write_field(self.smb_reg_block_data, 'BlockData', x)
-            # clear done flag to signal advance the SRAM pointer
-            self.cs.register.write_field(self.smb_reg_status, 'DS', 0)
-            if not self._wait_for_cycle():
-                return 0xFF
+        self.cs.register.write_field(self.smb_reg_block_data, 'BlockData', buf[0])
 
         # send SMBus txn
         self.cs.register.write_field(self.smb_reg_control, 'START', 1)
            
         # wait for cycle to complete
         if not self._wait_for_cycle():
+            # fail or NACK after first byte, clear status
+            self.cs.register.write(self.smb_reg_status, 0xFF)
             return False
+
+        for i in range(1, amount):
+            if not self._wait_for_byte_done():
+                self.logger.log_error(f"SMBus transaction failed (writing byte {i})")
+                return False
+            # write byte
+            self.cs.register.write_field(self.smb_reg_block_data, 'BlockData', buf[i])
+            self.cs.register.write(self.smb_reg_status, SMBUS_BLOCK_DONE_STATUS)
+
+        if not self._wait_for_byte_done():
+            self.cs.register.write(self.smb_reg_status, 0xFF)
+            self.logger.log_error("SMBus transaction failed (last byte)")
+            return False
+
         # clear status bits
         self.cs.register.write(self.smb_reg_status, 0xFF)
-        # clear address/offset registers
-        #chipsec.chipset.write_register( self.cs, self.smb_reg_address, 0x0 )
-        #chipsec.chipset.write_register( self.cs, self.smb_reg_command, 0x0 )
+
         if self.logger.HAL:
             self.logger.log("[smbus] write to device {:X} off {:X} = {}".format(target_address, offset, ''.join('{:02x}'.format(x) for x in buf)))
         return True
